@@ -5,7 +5,17 @@
 #include <QTimer>
 #include <QTcpServer>
 #include <QTcpSocket>
+#include <QMetaType>
 #include <QTextCursor>
+#include <QTextDocument>
+#include <cmath>
+
+namespace {
+constexpr double kMaxLinearSpeed = 2000.0;
+constexpr double kMaxJointSpeed = 360.0;
+constexpr double kMaxLinearAccel = 10000.0;
+constexpr double kMaxJointAccel = 720.0;
+}
 
 /**
  * @brief 机器人控制面板构造函数
@@ -24,10 +34,16 @@ FormRobotPilot::FormRobotPilot(RoboDK *rdk, QWidget *parent) : QWidget(parent),
     , m_workerThread2(nullptr)
     , m_robotWorker1(nullptr)
     , m_robotWorker2(nullptr)
+    , m_Distance(600)
+    , m_StopType(1)
+    , m_nRadarNum(0)
     , m_isAllRobot(false)
+	, m_bIsRealRobot(false)
 {
     // 保存RoboDK接口指针
     RDK = rdk;  
+    qRegisterMetaType<Item>("Item");
+    qRegisterMetaType<QVector<double>>("QVector<double>");
     // 初始化机器人对象为空
     Robot = nullptr;  
 
@@ -39,6 +55,7 @@ FormRobotPilot::FormRobotPilot(RoboDK *rdk, QWidget *parent) : QWidget(parent),
     Product = RDK->getItem("product", IItem::ITEM_TYPE_OBJECT);
     // 初始化UI界面
     ui->setupUi(this);  
+    ui->textEditLog->document()->setMaximumBlockCount(500);
     ui->label_ZBX->hide();
     ui->label_Robot1->hide();
     ui->widget_2->hide();
@@ -55,10 +72,10 @@ FormRobotPilot::FormRobotPilot(RoboDK *rdk, QWidget *parent) : QWidget(parent),
     ui->spnStep->setDecimals(6);
     // 尝试选择机器人
     //SelectRobot();  
-    // 初始化定时器(100ms间隔，每秒10次)
+    // 初始化定时器(降低频率以减少网络负载)
     m_timer = new QTimer(this);
     connect(m_timer, &QTimer::timeout, this, &FormRobotPilot::updateCartesianPosition);
-    m_timer->start(500);
+    m_timer->start(1000);  // 改为1秒更新一次，减少网络负载
 
     m_RadarTimer = new QTimer(this);
     connect(m_RadarTimer, &QTimer::timeout, this, &FormRobotPilot::Slot_RadarTimeOut);
@@ -104,24 +121,32 @@ FormRobotPilot::FormRobotPilot(RoboDK *rdk, QWidget *parent) : QWidget(parent),
 
     GetDistance();
 
-    // 初始化雷达设备
-    discoverAndSetupDevices();
-
     // 创建工作线程1
     m_workerThread1 = new QThread(this);
     m_robotWorker1 = new RobotWorker(RDK);
     m_robotWorker1->moveToThread(m_workerThread1);
 
-    connect(this, &FormRobotPilot::requestMoveCartesian,
-            m_robotWorker1, &RobotWorker::executeMoveCartesian);
-    connect(this, &FormRobotPilot::requestMoveJoints,
-            m_robotWorker1, &RobotWorker::executeMoveJoints);
+    connect(this, &FormRobotPilot::requestMoveCartesianWorker1,
+            m_robotWorker1, &RobotWorker::executeMoveCartesian,
+            Qt::QueuedConnection);
+    connect(this, &FormRobotPilot::requestMoveJointsWorker1,
+            m_robotWorker1, &RobotWorker::executeMoveJoints,
+            Qt::QueuedConnection);
+    connect(this, &FormRobotPilot::requestSetSpeedWorker1,
+            m_robotWorker1, &RobotWorker::executeSetSpeed,
+            Qt::QueuedConnection);
     connect(this, &FormRobotPilot::requestStop,
-            m_robotWorker1, &RobotWorker::stopMovement);
+            m_robotWorker1, &RobotWorker::setStopRequested,
+            Qt::DirectConnection);
     connect(m_robotWorker1, &RobotWorker::moveCompleted,
-            this, &FormRobotPilot::onMoveCompleted);
+            this, [this](bool success, QString message) {
+                m_robot1Moving.storeRelaxed(0);
+                onMoveCompleted(success, message);
+            },
+            Qt::QueuedConnection);
     connect(m_robotWorker1, &RobotWorker::moveStarted,
-            this, &FormRobotPilot::onMoveStarted);
+            this, &FormRobotPilot::onMoveStarted,
+            Qt::QueuedConnection);
     connect(m_workerThread1, &QThread::finished,
             m_robotWorker1, &QObject::deleteLater);
 
@@ -132,16 +157,27 @@ FormRobotPilot::FormRobotPilot(RoboDK *rdk, QWidget *parent) : QWidget(parent),
     m_robotWorker2 = new RobotWorker(RDK);
     m_robotWorker2->moveToThread(m_workerThread2);
 
-    connect(this, &FormRobotPilot::requestMoveCartesian,
-            m_robotWorker2, &RobotWorker::executeMoveCartesian);
-    connect(this, &FormRobotPilot::requestMoveJoints,
-            m_robotWorker2, &RobotWorker::executeMoveJoints);
+    connect(this, &FormRobotPilot::requestMoveCartesianWorker2,
+            m_robotWorker2, &RobotWorker::executeMoveCartesian,
+            Qt::QueuedConnection);
+    connect(this, &FormRobotPilot::requestMoveJointsWorker2,
+            m_robotWorker2, &RobotWorker::executeMoveJoints,
+            Qt::QueuedConnection);
+    connect(this, &FormRobotPilot::requestSetSpeedWorker2,
+            m_robotWorker2, &RobotWorker::executeSetSpeed,
+            Qt::QueuedConnection);
     connect(this, &FormRobotPilot::requestStop,
-            m_robotWorker2, &RobotWorker::stopMovement);
+            m_robotWorker2, &RobotWorker::setStopRequested,
+            Qt::DirectConnection);
     connect(m_robotWorker2, &RobotWorker::moveCompleted,
-            this, &FormRobotPilot::onMoveCompleted);
+            this, [this](bool success, QString message) {
+                m_robot2Moving.storeRelaxed(0);
+                onMoveCompleted(success, message);
+            },
+            Qt::QueuedConnection);
     connect(m_robotWorker2, &RobotWorker::moveStarted,
-            this, &FormRobotPilot::onMoveStarted);
+            this, &FormRobotPilot::onMoveStarted,
+            Qt::QueuedConnection);
     connect(m_workerThread2, &QThread::finished,
             m_robotWorker2, &QObject::deleteLater);
 
@@ -160,6 +196,65 @@ FormRobotPilot::FormRobotPilot(RoboDK *rdk, QWidget *parent) : QWidget(parent),
  */
 FormRobotPilot::~FormRobotPilot()
 {
+    // 停止工作线程
+    if (m_workerThread1) {
+        m_workerThread1->quit();
+        if (m_workerThread1->wait(5000)) {
+            delete m_workerThread1;
+        } else {
+            qWarning() << "Worker thread 1 did not stop within timeout";
+            m_workerThread1->setParent(nullptr);
+        }
+        m_workerThread1 = nullptr;
+        m_robotWorker1 = nullptr;
+    }
+    if (m_workerThread2) {
+        m_workerThread2->quit();
+        if (m_workerThread2->wait(5000)) {
+            delete m_workerThread2;
+        } else {
+            qWarning() << "Worker thread 2 did not stop within timeout";
+            m_workerThread2->setParent(nullptr);
+        }
+        m_workerThread2 = nullptr;
+        m_robotWorker2 = nullptr;
+    }
+    if (m_tcpServer)
+    {
+        m_tcpServer->close();
+        delete m_tcpServer;
+        m_tcpServer = nullptr;
+    }
+
+    if(m_Radarsocket)
+    {
+        m_Radarsocket->disconnectFromHost();
+        delete m_Radarsocket;
+        m_Radarsocket = nullptr;
+    }
+
+    if (m_clientSocket)
+    {
+        m_clientSocket->disconnectFromHost();
+        delete m_clientSocket;
+        m_clientSocket = nullptr;
+    }
+
+    if (m_timer)
+    {
+        m_timer->stop();
+        delete m_timer;
+        m_timer = nullptr;
+    }
+    if (m_RadarTimer)
+    {
+        m_RadarTimer->stop();
+        delete m_RadarTimer;
+        m_RadarTimer = nullptr;
+    }
+
+    qDebug() << "Worker threads stopped";
+
     delete ui;  // 释放UI资源
 }
 /**
@@ -368,7 +463,7 @@ void FormRobotPilot::IncrementalMove(int id, double sense)
             return;
         }
         joints.Data()[id] = joints.Data()[id] + step;
-        bool can_move = Robot->MoveL(joints);
+        bool can_move = Robot->MoveJ(joints);
         if (!can_move)
         {
             RDK->ShowMessage(QString::fromLocal8Bit("当前位置不可达"), false);
@@ -406,7 +501,7 @@ void FormRobotPilot::IncrementalMove(int id, double sense)
             Mat movement_pose_aligned = transformation_axes.inv() * pose_increment * transformation_axes;
             pose_robot_new = pose_robot * movement_pose_aligned;
         }
-        bool canmove = Robot->MoveL(pose_robot_new);
+        bool canmove = Robot->MoveJ(pose_robot_new);
         if (!canmove)
         {
             RDK->ShowMessage(QString::fromLocal8Bit("当前位置不可达"), false);
@@ -420,12 +515,18 @@ void FormRobotPilot::IncrementalMove(int id, double sense)
  */
 void FormRobotPilot::updateCartesianPosition()
 {
-    //if (!Robot)
-    //{
-    //    return;
-    //}
+    if (!RDK) {
+        return;
+    }
 
-    RDK->Render();
+    if (m_bIsRealRobot &&
+        (m_robot1Moving.loadRelaxed() == 1 || m_robot2Moving.loadRelaxed() == 1)) {
+        return;
+    }
+
+    if (!m_bIsRealRobot) {
+        RDK->Render(false);
+    }
 
     if (ui->radJoints->isChecked())
     {
@@ -458,7 +559,7 @@ void FormRobotPilot::updateCartesianPosition()
             ui->lineEdit_Ry_3->setText(QString::number(joints2.Data()[4], 'f', 6));
             ui->lineEdit_Rz_3->setText(QString::number(joints2.Data()[5], 'f', 6));
         }
-    } 
+    }
     else
     {
         if (!m_isAllRobot && Robot)
@@ -473,7 +574,7 @@ void FormRobotPilot::updateCartesianPosition()
             ui->lineEdit_Rx->setText(QString::number(xyzwpr[3], 'f', 6));
             ui->lineEdit_Ry->setText(QString::number(xyzwpr[4], 'f', 6));
             ui->lineEdit_Rz->setText(QString::number(xyzwpr[5], 'f', 6));
-        } 
+        }
         else if (Robot1 && Robot2)
         {
             // 笛卡尔模式：显示TCP位姿
@@ -512,8 +613,12 @@ void FormRobotPilot::onNewConnection()
 {
     if (m_clientSocket) 
     {
+        m_clientSocket->disconnect(this);
         m_clientSocket->disconnectFromHost();
+        m_clientSocket->deleteLater();
+        m_clientSocket = nullptr;
     }
+    m_tcpRecvBuffer.clear();
     
     m_clientSocket = m_tcpServer->nextPendingConnection();
     connect(m_clientSocket, &QTcpSocket::readyRead, this, &FormRobotPilot::onReadyRead);
@@ -529,10 +634,45 @@ void FormRobotPilot::onNewConnection()
  */
 void FormRobotPilot::onReadyRead()
 {
-    QByteArray data = m_clientSocket->readAll();
-    QString Allmessage = QString::fromLocal8Bit(data).trimmed();
-    QStringList MessageList = Allmessage.split("\r\n");
-    for (QString message : MessageList)
+    if (!m_clientSocket) {
+        return;
+    }
+
+    m_tcpRecvBuffer.append(m_clientSocket->readAll());
+    QStringList MessageList;
+    int lineEnd = -1;
+    while ((lineEnd = m_tcpRecvBuffer.indexOf('\n')) >= 0)
+    {
+        QByteArray line = m_tcpRecvBuffer.left(lineEnd);
+        m_tcpRecvBuffer.remove(0, lineEnd + 1);
+        QString message = QString::fromLocal8Bit(line).trimmed();
+        if (!message.isEmpty()) {
+            MessageList.append(message);
+        }
+    }
+
+    if (!m_tcpRecvBuffer.isEmpty())
+    {
+        QString pending = QString::fromLocal8Bit(m_tcpRecvBuffer).trimmed();
+        int partCount = pending.split("_").size();
+        bool completeWithoutNewline =
+            !pending.endsWith("_") &&
+            (partCount == 2 || partCount == 3 || partCount == 6 || partCount == 8 || partCount == 9);
+
+        if (completeWithoutNewline)
+        {
+            MessageList.append(pending);
+            m_tcpRecvBuffer.clear();
+        }
+        else if (m_tcpRecvBuffer.size() > 8192)
+        {
+            m_tcpRecvBuffer.clear();
+            m_clientSocket->write("Invalid command buffer");
+            return;
+        }
+    }
+
+    for (const QString& message : MessageList)
     {
         if (!message.isEmpty())
         {
@@ -721,62 +861,63 @@ void FormRobotPilot::onReadyRead()
                             m_clientSocket->write("Failed to open project");
                         }
                     }
-                    // 读取JSON文件
-                    else if (Execute == "ReadJson")
-                    {
-                        // 读取JSON文件命令格式: M ReadJson filename.json
-                        QString filename = parts[2];
-                        bool success = ReadJsonFile(filename);
-                        if (success)
-                        {
-                            m_clientSocket->write(QString("JSON file read successfully: %1").arg(filename).toLocal8Bit());
-                        }
-                        else
-                        {
-                            m_clientSocket->write(QString("Failed to read JSON file: %1").arg(filename).toLocal8Bit());
-                        }
-                    }
+                    //// 读取JSON文件
+                    //else if (Execute == "ReadJson")
+                    //{
+                    //    // 读取JSON文件命令格式: M ReadJson filename.json
+                    //    QString filename = parts[2];
+                    //    bool success = ReadJsonFile(filename);
+                    //    if (success)
+                    //    {
+                    //        m_clientSocket->write(QString("JSON file read successfully: %1").arg(filename).toLocal8Bit());
+                    //    }
+                    //    else
+                    //    {
+                    //        m_clientSocket->write(QString("Failed to read JSON file: %1").arg(filename).toLocal8Bit());
+                    //    }
+                    //}
                 }
                 // 获取数据命令
                 else if (command == "G")
                 {
-                    if (Execute == "T" &&  "Pos")
+                    QString subCommand = parts[2];
+                    if (Execute == "T" && subCommand == "Pos")
                     {
                         // 获取工具坐标位置命令格式: G T_Pos
                         QString toolPos = GetToolPosition();
                         m_clientSocket->write(toolPos.toLocal8Bit());
                     }
-                    else if (Execute == "T1" && "Pos")
+                    else if (Execute == "T1" && subCommand == "Pos")
                     {
                         // 获取工具坐标位置命令格式: G T_Pos
                         QString toolPos = GetToolPosition1();
                         m_clientSocket->write(toolPos.toLocal8Bit());
                     }
-                    else if (Execute == "T2" && "Pos")
+                    else if (Execute == "T2" && subCommand == "Pos")
                     {
                         // 获取工具坐标位置命令格式: G T_Pos
                         QString toolPos = GetToolPosition2();
                         m_clientSocket->write(toolPos.toLocal8Bit());
                     }
-                    else if (Execute == "J" &&  "Pos")
+                    else if (Execute == "J" && subCommand == "Pos")
                     {
                         // 获取关节位置命令格式: G J_Pos
                         QString jointPos = GetJointPositions();
                         m_clientSocket->write(jointPos.toLocal8Bit());
                     }
-                    else if (Execute == "J1" && "Pos")
+                    else if (Execute == "J1" && subCommand == "Pos")
                     {
                         // 获取关节位置命令格式: G J_Pos
                         QString jointPos = GetJointPositions1();
                         m_clientSocket->write(jointPos.toLocal8Bit());
                     }
-                    else if (Execute == "J2" && "Pos")
+                    else if (Execute == "J2" && subCommand == "Pos")
                     {
                         // 获取关节位置命令格式: G J_Pos
                         QString jointPos = GetJointPositions2();
                         m_clientSocket->write(jointPos.toLocal8Bit());
                     }
-                    else if (Execute == "All" && "Pos")
+                    else if (Execute == "All" && subCommand == "Pos")
                     {
                         QString toolPos = GetToolPosition();
                         QString jointPos = GetJointPositions();
@@ -821,12 +962,14 @@ void FormRobotPilot::onReadyRead()
                     Item item = RDK->getItem(itemName);
                     if (RDK->Valid(item))
                     {
-                        bool ok;
-                        double rx = parts[3].toDouble(&ok);
-                        double ry = parts[4].toDouble(&ok);
-                        double rz = parts[5].toDouble(&ok);
+                        bool okRx = false;
+                        bool okRy = false;
+                        bool okRz = false;
+                        double rx = parts[3].toDouble(&okRx);
+                        double ry = parts[4].toDouble(&okRy);
+                        double rz = parts[5].toDouble(&okRz);
 
-                        if (ok)
+                        if (okRx && okRy && okRz)
                         {
                             Mat currentPose = item->Pose();
                             Mat rotation = Mat::rotx(rx) * Mat::roty(ry) * Mat::rotz(rz);
@@ -852,12 +995,14 @@ void FormRobotPilot::onReadyRead()
                     Item item = RDK->getItem(itemName);
                     if (RDK->Valid(item))
                     {
-                        bool ok;
-                        double x = parts[3].toDouble(&ok);
-                        double y = parts[4].toDouble(&ok);
-                        double z = parts[5].toDouble(&ok);
+                        bool okX = false;
+                        bool okY = false;
+                        bool okZ = false;
+                        double x = parts[3].toDouble(&okX);
+                        double y = parts[4].toDouble(&okY);
+                        double z = parts[5].toDouble(&okZ);
 
-                        if (ok)
+                        if (okX && okY && okZ)
                         {
                             Mat currentPose = item->Pose();
                             Mat translation = Mat::transl(x, y, z);
@@ -878,7 +1023,34 @@ void FormRobotPilot::onReadyRead()
                 }
                 else if (Execute == "Speed")
                 {
-                    SetSpeed(parts[2].toDouble(), parts[3].toDouble(), parts[4].toDouble(), parts[5].toDouble());
+                    if (command != "M")
+                    {
+                        m_clientSocket->write("Invalid speed command");
+                    }
+                    else
+                    {
+                        bool okLinearSpeed = false;
+                        bool okJointSpeed = false;
+                        bool okLinearAccel = false;
+                        bool okJointAccel = false;
+                        double speedLinear = parts[2].toDouble(&okLinearSpeed);
+                        double speedJoints = parts[3].toDouble(&okJointSpeed);
+                        double accelLinear = parts[4].toDouble(&okLinearAccel);
+                        double accelJoints = parts[5].toDouble(&okJointAccel);
+
+                        if (!okLinearSpeed || !okJointSpeed || !okLinearAccel || !okJointAccel)
+                        {
+                            m_clientSocket->write("Invalid speed parameters");
+                        }
+                        else if (SetSpeed(speedLinear, speedJoints, accelLinear, accelJoints))
+                        {
+                            m_clientSocket->write("Speed set");
+                        }
+                        else
+                        {
+                            m_clientSocket->write("Failed to set speed");
+                        }
+                    }
                 }
             }
             else if (parts.size() == 9)
@@ -892,15 +1064,20 @@ void FormRobotPilot::onReadyRead()
                     Item item = RDK->getItem(itemName);
                     if (RDK->Valid(item))
                     {
-                        bool ok;
-                        double x = parts[3].toDouble(&ok);
-                        double y = parts[4].toDouble(&ok);
-                        double z = parts[5].toDouble(&ok);
-                        double rx = parts[6].toDouble(&ok);
-                        double ry = parts[7].toDouble(&ok);
-                        double rz = parts[8].toDouble(&ok);
+                        bool okX = false;
+                        bool okY = false;
+                        bool okZ = false;
+                        bool okRx = false;
+                        bool okRy = false;
+                        bool okRz = false;
+                        double x = parts[3].toDouble(&okX);
+                        double y = parts[4].toDouble(&okY);
+                        double z = parts[5].toDouble(&okZ);
+                        double rx = parts[6].toDouble(&okRx);
+                        double ry = parts[7].toDouble(&okRy);
+                        double rz = parts[8].toDouble(&okRz);
 
-                        if (ok)
+                        if (okX && okY && okZ && okRx && okRy && okRz)
                         {
                             tXYZWPR pose;
                             pose[0] = x; pose[1] = y; pose[2] = z;
@@ -1004,11 +1181,13 @@ void FormRobotPilot::onReadyRead()
                 {
                     if (Execute == "UseRobot")
                     {
+                        m_bIsRealRobot = true;
                         ui->chkRunOnRobot->setCheckState(Qt::Checked);
                         on_chkRunOnRobot_clicked(true);
                     }
                     else
                     {
+                        m_bIsRealRobot = false;
                         ui->chkRunOnRobot->setCheckState(Qt::Unchecked);
                         on_chkRunOnRobot_clicked(false);
                     }
@@ -1024,10 +1203,12 @@ void FormRobotPilot::onReadyRead()
 
 void FormRobotPilot::Slot_BtnStop()
 {
-    if (m_Stop)
+    if (m_Stop.loadRelaxed() == 1)
     {
         // 解除急停
-        m_Stop = false;
+        m_Stop.storeRelaxed(0);
+        emit requestStop(false);
+        qDebug() << "Stop requested from main thread";
         ui->btn_Stop->setText(QString::fromLocal8Bit("急停"));
         if (m_clientSocket)
         {
@@ -1042,8 +1223,9 @@ void FormRobotPilot::Slot_BtnStop()
     else
     {
         // 触发急停
-        //Robot->Stop();
-        m_Stop = true;
+        m_Stop.storeRelaxed(1);
+        emit requestStop(true);
+        qDebug() << "Stop requested from main thread";
         ui->btn_Stop->setText(QString::fromLocal8Bit("恢复"));
         if (m_clientSocket)
         {
@@ -1080,25 +1262,29 @@ void FormRobotPilot::RonReadyRead()
     if(StrData.contains("5"))
     {
         ui->textEditLog->append(QString::fromLocal8Bit("一、二号机械臂急停"));
-        m_Stop = true;
+        m_Stop.storeRelaxed(1);
+        emit requestStop(true);
         ui->btn_Stop->setText(QString::fromLocal8Bit("恢复"));
     }
     else if(StrData.contains("1"))
     {
         ui->textEditLog->append(QString::fromLocal8Bit("二号机械臂急停"));
-        m_Stop = true;
+        m_Stop.storeRelaxed(1);
+        emit requestStop(true);
         ui->btn_Stop->setText(QString::fromLocal8Bit("恢复"));
     }
     else if(StrData.contains("2"))
     {
         ui->textEditLog->append(QString::fromLocal8Bit("一号机械臂急停"));
-        m_Stop = true;
+        m_Stop.storeRelaxed(1);
+        emit requestStop(true);
         ui->btn_Stop->setText(QString::fromLocal8Bit("恢复"));
     }
     else if(StrData.contains("3"))
     {
         ui->textEditLog->append(QString::fromLocal8Bit("一、二号机械臂恢复"));
-        m_Stop = false;
+        m_Stop.storeRelaxed(0);
+        emit requestStop(false);
         ui->btn_Stop->setText(QString::fromLocal8Bit("急停"));
     }
 }
@@ -1128,128 +1314,201 @@ void FormRobotPilot::Slot_RadarTimeOut()
  */
 bool FormRobotPilot::moveToCartesian(const QVector<double>& values)
 {
-    if (!Robot) 
+    if (!Robot) {
+        RDK->ShowMessage(QString::fromLocal8Bit("未选择有效机器人"), false);
         return false;
-    tXYZWPR xyzwpr;
-    for (int i = 0; i < 6; ++i) 
-    {
-        xyzwpr[i] = values[i];
     }
-    qDebug() << QString::fromLocal8Bit("检查碰撞");
-    // 启用碰撞检测
-    RDK->setCollisionActive(true);
-    Mat pose;
-    pose.FromXYZRPW(xyzwpr);
-    bool can_move = Robot->MoveJ(pose);
-    if (!can_move)
+    if (values.size() != 6) {
+        RDK->ShowMessage(QString::fromLocal8Bit("坐标参数错误"), false);
+        return false;
+    }
+
+    if(m_bIsRealRobot)
     {
-        // 检查是否是碰撞导致
-        if (RDK->Collision(Robot, Product))  // 检查机器人与所有物体的碰撞 
-        {
-            RDK->ShowMessage(tr("Movement stopped due to collision!"), false);
-            if (m_clientSocket)
-            {
-                m_clientSocket->write("Movement stopped due to collision!");
-            }
-            
+        if (m_Stop.loadRelaxed() == 1) {
+            RDK->ShowMessage(QString::fromLocal8Bit("急停状态下禁止运动"), false);
             return false;
         }
-        else 
-        {
-            RDK->ShowMessage(tr("The robot can't move to this location"), false);
-            if (m_clientSocket)
-            {
-                m_clientSocket->write("The robot can't move to this location");
-            }
-            
+        if (m_robot1Moving.loadRelaxed() == 1) {
+            qDebug() << "Worker1 is already moving";
             return false;
         }
+        m_robot1Moving.storeRelaxed(1);
+        int mode = ui->radCartesianReference->isChecked() ? 0 :
+           (ui->radCartesianTool->isChecked() ? 1 : 2);
+		emit requestMoveCartesianWorker1(Robot, values, mode);
     }
-    RDK->Render();
+    else
+    {
+        tXYZWPR xyzwpr;
+        for (int i = 0; i < 6; ++i)
+        {
+            xyzwpr[i] = values[i];
+        }
+
+        RDK->setCollisionActive(true);
+        Mat pose;
+        pose.FromXYZRPW(xyzwpr);
+        bool can_move = Robot->MoveJ(pose);
+        if (!can_move)
+        {
+            // 检查是否是碰撞导致
+            if (RDK->Collision(Robot, Product))  // 检查机器人与所有物体的碰撞
+            {
+                RDK->ShowMessage(tr("Movement stopped due to collision!"), false);
+                if (m_clientSocket)
+                {
+                    m_clientSocket->write("Movement stopped due to collision!");
+                }
+
+                return false;
+            }
+            else
+            {
+                RDK->ShowMessage(tr("The robot can't move to this location"), false);
+                if (m_clientSocket)
+                {
+                    m_clientSocket->write("The robot can't move to this location");
+                }
+
+                return false;
+            }
+        }
+        RDK->Render();
+    }
+
     return true;
 }
 bool FormRobotPilot::Robot1moveToCartesian(const QVector<double>& values)
 {
-    if (!Robot1)
+    if (!Robot1 ) {
+        RDK->ShowMessage(QString::fromLocal8Bit("Robot1未选择或无效"), false);
         return false;
-    tXYZWPR xyzwpr;
-    for (int i = 0; i < 6; ++i)
-    {
-        xyzwpr[i] = values[i];
     }
-    qDebug() << QString::fromLocal8Bit("检查碰撞");
-    // 启用碰撞检测
-    RDK->setCollisionActive(true);
-    Mat pose;
-    pose.FromXYZRPW(xyzwpr);
-    bool can_move = Robot1->MoveJ(pose);
-    if (!can_move)
-    {
-        // 检查是否是碰撞导致
-        if (RDK->Collision(Robot1, Product))  // 检查机器人与所有物体的碰撞 
-        {
-            RDK->ShowMessage(tr("Movement stopped due to collision!"), false);
-            if (m_clientSocket)
-            {
-                m_clientSocket->write("Movement stopped due to collision!");
-            }
+    if (values.size() != 6) {
+        RDK->ShowMessage(QString::fromLocal8Bit("坐标参数错误"), false);
+        return false;
+    }
+    int mode = ui->radCartesianReference->isChecked() ? 0 :
+               (ui->radCartesianTool->isChecked() ? 1 : 2);
 
+    if(m_bIsRealRobot)
+    {
+        if (m_Stop.loadRelaxed() == 1) {
+            RDK->ShowMessage(QString::fromLocal8Bit("急停状态下禁止运动"), false);
             return false;
         }
-        else
-        {
-            RDK->ShowMessage(tr("The robot can't move to this location"), false);
-            if (m_clientSocket)
-            {
-                m_clientSocket->write("The robot can't move to this location");
-            }
-
+        if (m_robot1Moving.loadRelaxed() == 1) {
+            qDebug() << "Robot1 is already moving";
             return false;
         }
+        m_robot1Moving.storeRelaxed(1);
+        emit requestMoveCartesianWorker1(Robot1, values, mode);
     }
-    RDK->Render();
+    else
+    {
+        tXYZWPR xyzwpr;
+        for (int i = 0; i < 6; ++i)
+        {
+            xyzwpr[i] = values[i];
+        }
+
+        RDK->setCollisionActive(true);
+        Mat pose;
+        pose.FromXYZRPW(xyzwpr);
+        bool can_move = Robot1->MoveJ(pose);
+        if (!can_move)
+        {
+            // 检查是否是碰撞导致
+            if (RDK->Collision(Robot1, Product))  // 检查机器人与所有物体的碰撞
+            {
+                RDK->ShowMessage(tr("Movement stopped due to collision!"), false);
+                if (m_clientSocket)
+                {
+                    m_clientSocket->write("Movement stopped due to collision!");
+                }
+
+                return false;
+            }
+            else
+            {
+                RDK->ShowMessage(tr("The robot can't move to this location"), false);
+                if (m_clientSocket)
+                {
+                    m_clientSocket->write("The robot can't move to this location");
+                }
+
+                return false;
+            }
+        }
+        RDK->Render();
+    }
+
     return true;
 }
 bool FormRobotPilot::Robot2moveToCartesian(const QVector<double>& values)
 {
-    if (!Robot2)
+    if (!Robot2) {
+        RDK->ShowMessage(QString::fromLocal8Bit("Robot2未选择或无效"), false);
         return false;
-    tXYZWPR xyzwpr;
-    for (int i = 0; i < 6; ++i)
-    {
-        xyzwpr[i] = values[i];
     }
-    qDebug() << QString::fromLocal8Bit("检查碰撞");
-    // 启用碰撞检测
-    RDK->setCollisionActive(true);
-    Mat pose;
-    pose.FromXYZRPW(xyzwpr);
-    bool can_move = Robot2->MoveJ(pose);
-    if (!can_move)
+    if (values.size() != 6) {
+        RDK->ShowMessage(QString::fromLocal8Bit("坐标参数错误"), false);
+        return false;
+    }
+    int mode = ui->radCartesianReference->isChecked() ? 0 :
+               (ui->radCartesianTool->isChecked() ? 1 : 2);
+    if(m_bIsRealRobot)
     {
-        // 检查是否是碰撞导致
-        if (RDK->Collision(Robot2, Product))  // 检查机器人与所有物体的碰撞 
-        {
-            RDK->ShowMessage(tr("Movement stopped due to collision!"), false);
-            if (m_clientSocket)
-            {
-                m_clientSocket->write("Movement stopped due to collision!");
-            }
-
+        if (m_Stop.loadRelaxed() == 1) {
+            RDK->ShowMessage(QString::fromLocal8Bit("急停状态下禁止运动"), false);
             return false;
         }
-        else
-        {
-            RDK->ShowMessage(tr("The robot can't move to this location"), false);
-            if (m_clientSocket)
-            {
-                m_clientSocket->write("The robot can't move to this location");
-            }
-
+        if (m_robot2Moving.loadRelaxed() == 1) {
+            qDebug() << "Robot2 is already moving";
             return false;
         }
+        m_robot2Moving.storeRelaxed(1);
+        emit requestMoveCartesianWorker2(Robot2, values, mode);
     }
-    RDK->Render();
+    else
+    {
+        tXYZWPR xyzwpr;
+        for (int i = 0; i < 6; ++i)
+        {
+            xyzwpr[i] = values[i];
+        }
+
+        RDK->setCollisionActive(true);
+        Mat pose;
+        pose.FromXYZRPW(xyzwpr);
+        bool can_move = Robot2->MoveJ(pose);
+        if (!can_move)
+        {
+            // 检查是否是碰撞导致
+            if (RDK->Collision(Robot2, Product))  // 检查机器人与所有物体的碰撞
+            {
+                RDK->ShowMessage(tr("Movement stopped due to collision!"), false);
+                if (m_clientSocket)
+                {
+                    m_clientSocket->write("Movement stopped due to collision!");
+                }
+
+                return false;
+            }
+            else
+            {
+                RDK->ShowMessage(tr("The robot can't move to this location"), false);
+                if (m_clientSocket)
+                {
+                    m_clientSocket->write("The robot can't move to this location");
+                }
+
+                return false;
+            }
+        }
+        RDK->Render();
+    }
     return true;
 }
 /**
@@ -1257,55 +1516,43 @@ bool FormRobotPilot::Robot2moveToCartesian(const QVector<double>& values)
  */
 bool FormRobotPilot::moveToJoints(const QVector<double>& values)
 {
-    if (!Robot) 
+    if (!Robot) {
+        RDK->ShowMessage(QString::fromLocal8Bit("未选择有效机器人"), false);
         return false;
-    tJoints joints;
-    for (int i = 0; i < 6; ++i) 
-    {
-        joints.Data()[i] = values[i];
     }
-    // 启用碰撞检测
-    RDK->setCollisionActive(true);
-    bool can_move = Robot->MoveJ(joints);
-    if (!can_move)
-    {
-        // 检查是否是碰撞导致
-        if (RDK->Collision(Robot, nullptr))
-        {
-            RDK->ShowMessage(tr("Movement stopped due to collision!"), false);
-            if (m_clientSocket)
-            {
-                m_clientSocket->write("Movement stopped due to collision!");
-            }
-            
-            return false;
-        }
-        else
-        {
-            RDK->ShowMessage(tr("The robot can't move to this location"), false);
-            if (m_clientSocket)
-            {
-                m_clientSocket->write("The robot can't move to this location");
-            }
-            
-            return false;
-        }
+    if (values.size() != 6) {
+        RDK->ShowMessage(QString::fromLocal8Bit("关节参数错误"), false);
+        return false;
     }
-    RDK->Render();
+    if (m_Stop.loadRelaxed() == 1) {
+        RDK->ShowMessage(QString::fromLocal8Bit("急停状态下禁止运动"), false);
+        return false;
+    }
+    if (m_robot1Moving.loadRelaxed() == 1) {
+        qDebug() << "Worker1 is already moving";
+        return false;
+    }
+    m_robot1Moving.storeRelaxed(1);
+    emit requestMoveJointsWorker1(Robot, values);
     return true;
 }
 
 bool FormRobotPilot::PlanningPosition(QVector<double>& target)
 {
-    // 步骤1: 获取/切换到指定 Robot（使用您的 GetRobotByName）
-    Item baseFrame = RDK->getItem(m_MapRobotAndBase.value(Robot->Name()), IItem::ITEM_TYPE_FRAME);
-    
     // 检查是否有活跃的机械臂
     if (!Robot)
     {
         RDK->ShowMessage(QString::fromLocal8Bit("请先选择机械臂"), true);
         return false;
     }
+    if (target.size() != 6)
+    {
+        RDK->ShowMessage(QString::fromLocal8Bit("目标参数错误"), true);
+        return false;
+    }
+
+    // 步骤1: 获取/切换到指定 Robot（使用您的 GetRobotByName）
+    Item baseFrame = RDK->getItem(m_MapRobotAndBase.value(Robot->Name()), IItem::ITEM_TYPE_FRAME);
     int mode = ui->radCartesianReference->isChecked() ? 0 :
         (ui->radCartesianTool->isChecked() ? 1 : 2);
     qDebug() << QString::fromLocal8Bit("可达性判断");
@@ -1513,19 +1760,60 @@ bool FormRobotPilot::SelectAllRobotByNames(const QString& name1, const QString& 
 
 bool FormRobotPilot::SetSpeed(double speed_linear, double speed_joints, double accel_linear, double accel_joints)
 {
-    if (Robot)
+    if (!std::isfinite(speed_linear) || !std::isfinite(speed_joints) ||
+        !std::isfinite(accel_linear) || !std::isfinite(accel_joints) ||
+        speed_linear <= 0.0 || speed_joints <= 0.0 ||
+        accel_linear < 0.0 || accel_joints < 0.0)
     {
-        Robot->setSpeed(speed_linear, speed_joints, accel_linear, accel_joints);
+        ui->textEditLog->append(QString::fromLocal8Bit("速度参数无效，已拒绝"));
+        return false;
     }
-    if (Robot1) 
+    if (speed_linear > kMaxLinearSpeed || speed_joints > kMaxJointSpeed ||
+        accel_linear > kMaxLinearAccel || accel_joints > kMaxJointAccel)
     {
-        Robot1->setSpeed(speed_linear, speed_joints, accel_linear, accel_joints);
+        ui->textEditLog->append(QString::fromLocal8Bit("速度参数超出安全上限，已拒绝"));
+        return false;
     }
-    if (Robot2)
+
+    bool applied = false;
+    auto applySpeed = [&](Item robot, bool useWorker1) {
+        if (!robot) {
+            return;
+        }
+
+        applied = true;
+        if (m_bIsRealRobot)
+        {
+            if (useWorker1) {
+                emit requestSetSpeedWorker1(robot, speed_linear, speed_joints, accel_linear, accel_joints);
+            } else {
+                emit requestSetSpeedWorker2(robot, speed_linear, speed_joints, accel_linear, accel_joints);
+            }
+        }
+        else
+        {
+            robot->setSpeed(speed_linear, speed_joints, accel_linear, accel_joints);
+        }
+    };
+
+    if (m_isAllRobot)
     {
-        Robot2->setSpeed(speed_linear, speed_joints, accel_linear, accel_joints);
+        applySpeed(Robot1, true);
+        applySpeed(Robot2, false);
     }
-    ui->textEditLog->setText(QString::fromLocal8Bit("线速度：%1，角速度：%2，线加速度：%3，角加速度：%4").arg(speed_linear).arg(speed_joints).arg(accel_linear).arg(accel_joints));
+    else
+    {
+        applySpeed(Robot, true);
+    }
+
+    if (!applied)
+    {
+        ui->textEditLog->append(QString::fromLocal8Bit("未选择有效机器人，速度未设置"));
+        return false;
+    }
+
+    ui->textEditLog->append(QString::fromLocal8Bit("线速度：%1，角速度：%2，线加速度：%3，角加速度：%4")
+                            .arg(speed_linear).arg(speed_joints).arg(accel_linear).arg(accel_joints));
     return true;
 }
 
@@ -1535,8 +1823,12 @@ bool FormRobotPilot::SetSpeed(double speed_linear, double speed_joints, double a
 void FormRobotPilot::onClientDisconnected()
 {
     ui->labelClientStatus->setText("No client connected");
-    m_clientSocket->deleteLater();
-    m_clientSocket = nullptr;
+    m_tcpRecvBuffer.clear();
+    if (m_clientSocket)
+    {
+        m_clientSocket->deleteLater();
+        m_clientSocket = nullptr;
+    }
 }
 
 /**
@@ -1613,6 +1905,8 @@ void FormRobotPilot::on_btnGetPos_clicked()
 
 void FormRobotPilot::on_chkRunOnRobot_clicked(bool checked)
 {
+    m_bIsRealRobot = checked;
+
     if (m_isAllRobot)
     {
         if (Robot1 && Robot2)
@@ -1623,6 +1917,7 @@ void FormRobotPilot::on_chkRunOnRobot_clicked(bool checked)
         else
         {
             RDK->ShowMessage(tr("Please Choose Robot"), false);
+            m_bIsRealRobot = false;
             ui->chkRunOnRobot->setCheckState(Qt::Unchecked);
             return;
         }
@@ -1636,6 +1931,7 @@ void FormRobotPilot::on_chkRunOnRobot_clicked(bool checked)
         else
         {
             RDK->ShowMessage(tr("Please Choose Robot"), false);
+            m_bIsRealRobot = false;
             ui->chkRunOnRobot->setCheckState(Qt::Unchecked);
             return;
         }
@@ -1650,230 +1946,9 @@ void FormRobotPilot::on_chkRunOnRobot_clicked(bool checked)
     else 
     {
         RDK->setRunMode(RoboDK::RUNMODE_SIMULATE);
+        RDK->Render();
         RDK->ShowMessage(tr("Run Mode set to simulate"), false);
     }
-}
-
-/**
- * @brief 读取JSON文件并处理数据
- * @param filename JSON文件路径
- * @return 是否成功读取和处理JSON文件
- */
-bool FormRobotPilot::ReadJsonFile(const QString& filename)
-{
-    QFile file(filename);
-    if (!file.open(QIODevice::ReadOnly))
-    {
-        ui->textEditLog->append("[" + QDateTime::currentDateTime().toString("hh:mm:ss") + "] Error: " + 
-                               QString::fromLocal8Bit("无法打开JSON文件: ") + filename);
-        return false;
-    }
-
-    QByteArray jsonData = file.readAll();
-    file.close();
-
-    QJsonParseError parseError;
-    QJsonDocument jsonDoc = QJsonDocument::fromJson(jsonData, &parseError);
-    
-    if (parseError.error != QJsonParseError::NoError)
-    {
-        ui->textEditLog->append("[" + QDateTime::currentDateTime().toString("hh:mm:ss") + "] Error: " + 
-                               QString::fromLocal8Bit("JSON解析错误: ") + parseError.errorString());
-        return false;
-    }
-
-    if (!jsonDoc.isObject())
-    {
-        ui->textEditLog->append("[" + QDateTime::currentDateTime().toString("hh:mm:ss") + "] Error: " + 
-                               QString::fromLocal8Bit("JSON文件格式错误，应为对象格式"));
-        return false;
-    }
-
-    QJsonObject jsonObject = jsonDoc.object();
-    bool success = ProcessJsonData(jsonObject);
-    
-    if (success)
-    {
-        ui->textEditLog->append("[" + QDateTime::currentDateTime().toString("hh:mm:ss") + "] Info: " + 
-                               QString::fromLocal8Bit("JSON文件处理成功: ") + filename);
-    }
-    
-    return success;
-}
-
-/**
- * @brief 处理JSON数据
- * @param jsonData JSON数据对象
- * @return 是否成功处理JSON数据
- */
-bool FormRobotPilot::ProcessJsonData(const QJsonObject& jsonData)
-{
-    // 检查是否有commands数组
-    if (jsonData.contains("commands") && jsonData["commands"].isArray())
-    {
-        QJsonArray commands = jsonData["commands"].toArray();
-        
-        for (const QJsonValue& commandValue : commands)
-        {
-            if (commandValue.isObject())
-            {
-                QJsonObject command = commandValue.toObject();
-                if (!ExecuteJsonCommand(command))
-                {
-                    ui->textEditLog->append("[" + QDateTime::currentDateTime().toString("hh:mm:ss") + "] Error: " + 
-                                           QString::fromLocal8Bit("执行JSON命令失败"));
-                    return false;
-                }
-            }
-        }
-        return true;
-    }
-    
-    // 如果没有commands数组，直接处理单个命令
-    return ExecuteJsonCommand(jsonData);
-}
-
-/**
- * @brief 执行JSON命令
- * @param command JSON命令对象
- * @return 是否成功执行命令
- */
-bool FormRobotPilot::ExecuteJsonCommand(const QJsonObject& command)
-{
-    if (!command.contains("type") || !command["type"].isString())
-    {
-        ui->textEditLog->append("[" + QDateTime::currentDateTime().toString("hh:mm:ss") + "] Error: " + 
-                               QString::fromLocal8Bit("JSON命令缺少type字段"));
-        return false;
-    }
-
-    QString commandType = command["type"].toString();
-    
-    if (commandType == "move")
-    {
-        // 移动命令
-        if (!command.contains("mode") || !command["mode"].isString())
-        {
-            ui->textEditLog->append("[" + QDateTime::currentDateTime().toString("hh:mm:ss") + "] Error: " + 
-                                   QString::fromLocal8Bit("移动命令缺少mode字段"));
-            return false;
-        }
-        
-        QString mode = command["mode"].toString();
-        QVector<double> values;
-        
-        // 解析位置参数
-        QStringList paramNames = {"x", "y", "z", "rx", "ry", "rz"};
-        for (const QString& param : paramNames)
-        {
-            if (command.contains(param) && command[param].isDouble())
-            {
-                values.append(command[param].toDouble());
-            }
-            else
-            {
-                values.append(0.0);
-            }
-        }
-        
-        if (values.size() == 6)
-        {
-            if (mode == "tool")
-            {
-                ui->radCartesianTool->click();
-                return moveToCartesian(values);
-            }
-            else if (mode == "reference")
-            {
-                ui->radCartesianReference->click();
-                return moveToCartesian(values);
-            }
-            else if (mode == "joints")
-            {
-                ui->radJoints->click();
-                return moveToJoints(values);
-            }
-        }
-    }
-    else if (commandType == "plan")
-    {
-        // 规划命令
-        QVector<double> values;
-        
-        // 解析位置参数
-        QStringList paramNames = {"x", "y", "z", "rx", "ry", "rz"};
-        for (const QString& param : paramNames)
-        {
-            if (command.contains(param) && command[param].isDouble())
-            {
-                values.append(command[param].toDouble());
-            }
-            else
-            {
-                values.append(0.0);
-            }
-        }
-        
-        if (values.size() == 6)
-        {
-            return PlanningPosition(values);
-        }
-    }
-    else if (commandType == "load_model")
-    {
-        // 加载模型命令
-        if (command.contains("filename") && command["filename"].isString())
-        {
-            QString filename = command["filename"].toString();
-            Item loadedItem = RDK->AddFile(filename);
-            return RDK->Valid(loadedItem);
-        }
-    }
-    else if (commandType == "set_pose")
-    {
-        // 设置模型位姿命令
-        if (command.contains("item") && command["item"].isString())
-        {
-            QString itemName = command["item"].toString();
-            Item item = RDK->getItem(itemName);
-            
-            if (RDK->Valid(item))
-            {
-                tXYZWPR pose;
-                QStringList paramNames = {"x", "y", "z", "rx", "ry", "rz"};
-                for (int i = 0; i < 6; ++i)
-                {
-                    if (command.contains(paramNames[i]) && command[paramNames[i]].isDouble())
-                    {
-                        pose[i] = command[paramNames[i]].toDouble();
-                    }
-                    else
-                    {
-                        pose[i] = 0.0;
-                    }
-                }
-                
-                Mat newPose;
-                newPose.FromXYZRPW(pose);
-                item->setPose(newPose);
-                RDK->Render();
-                return true;
-            }
-        }
-    }
-    else if (commandType == "select_robot")
-    {
-        // 选择机器人命令
-        if (command.contains("name") && command["name"].isString())
-        {
-            QString robotName = command["name"].toString();
-            return SelectRobotByName(robotName);
-        }
-    }
-    
-    ui->textEditLog->append("[" + QDateTime::currentDateTime().toString("hh:mm:ss") + "] Error: " + 
-                           QString::fromLocal8Bit("未知的JSON命令类型: ") + commandType);
-    return false;
 }
 
 /**
@@ -1881,6 +1956,12 @@ bool FormRobotPilot::ExecuteJsonCommand(const QJsonObject& command)
  */
 void FormRobotPilot::ClearAllTargets()
 {
+    if (!Robot)
+    {
+        ui->textEditLog->append(QString::fromLocal8Bit("未选择有效机器人，无法清空目标点"));
+        return;
+    }
+
     // 获取所有目标点
     QVector<Item> targets = m_MapRobotTarget.value(Robot);
     
@@ -2280,280 +2361,18 @@ void FormRobotPilot::SetDistance()
     settings.endGroup();
 }
 
-void FormRobotPilot::discoverAndSetupDevices()
+void FormRobotPilot::onMoveStarted()
 {
-    const auto ports = QSerialPortInfo::availablePorts();
-    const QStringList keywords = { "USB", "CH340", "FTDI", "PL2303", "CP210", "RS485", "Serial" };
-    int deviceIndex = 0;
-    m_nRadarNum = 0;
-
-    QList<QSerialPortInfo> TmpPort1;
-    for (auto It: ports)
-    {
-        if(It.portName() == m_Robot1ComNum || It.portName() == m_Robot2ComNum)
-        {
-            TmpPort1.append(It);
-        }
-    }
-    
-    for (const QSerialPortInfo& info : TmpPort1)
-    {
-        QString desc = info.description().toUpper() + info.manufacturer().toUpper();
-        bool isLikely = false;
-        for (const QString& key : keywords)
-            if (desc.contains(key))
-            { 
-                isLikely = true; 
-                break; 
-            }
-
-        if (info.vendorIdentifier() == 0x1A86 ||   // CH340
-            info.vendorIdentifier() == 0x10C4 ||   // CP2102
-            info.vendorIdentifier() == 0x067B)
-        {  
-            // PL2303
-            isLikely = true;
-        }
-
-        if (!isLikely) 
-            continue;
-
-        RadarDevice* dev = new RadarDevice;
-        if(info.portName() == m_Robot1ComNum)
-        {
-            dev->slaveAddress = 0x01;
-            dev->RobotName = QString::fromLocal8Bit("一号机械臂");
-        }
-        else if (info.portName() == m_Robot2ComNum)
-        {
-            dev->slaveAddress = 0x02;
-            dev->RobotName = QString::fromLocal8Bit("二号机械臂");
-        }
-        dev->portName = info.portName();
-        // dev->slaveAddress = (deviceIndex == 0) ? 0x01 : 0x02;
-        dev->addressSet = false;
-
-        // 关联对应机器人（假设 Robot1 和 Robot2 已通过其他方式获取）
-        // dev->RobotName = (deviceIndex == 0) ? QString::fromLocal8Bit("一号机械臂") : QString::fromLocal8Bit("二号机械臂");
-
-        dev->serial = new QSerialPort(this);
-        dev->serial->setPortName(dev->portName);
-        dev->serial->setBaudRate(QSerialPort::Baud115200);
-        dev->serial->setDataBits(QSerialPort::Data8);
-        dev->serial->setParity(QSerialPort::NoParity);
-        dev->serial->setStopBits(QSerialPort::OneStop);
-
-        if (!dev->serial->open(QIODevice::ReadWrite))
-        {
-            ui->textEditLog->append(QString("打开 %1 失败: %2")
-                .arg(dev->portName).arg(dev->serial->errorString()));
-            delete dev->serial;
-            delete dev;
-            continue;
-        }
-
-        connect(dev->serial, &QSerialPort::readyRead, this, [this, dev]() { 
-        	onDeviceReadyRead(dev);
-            });
-
-        dev->timer = new QTimer(this);
-        dev->timer->setInterval(500);
-
-        devices.append(dev);
-
-        deviceIndex++;
-
-        ui->textEditLog->append(QString::fromLocal8Bit("发现雷达设备 → %1，准备设置地址 0x%2")
-            .arg(dev->portName)
-            .arg(dev->slaveAddress, 2, 16, QChar('0')));
-
-        // 延时广播设置地址，避免冲突
-        QTimer::singleShot((devices.size() - 1) * 1000, this, [this, dev]() {
-            broadcastSetAddress(dev, dev->slaveAddress);
-            });
-    }
-
-    if (devices.isEmpty())
-    {
-        ui->textEditLog->append(QString::fromLocal8Bit("未检测到任何雷达设备！"));
-    }
-    else
-    {
-        ui->textEditLog->append(QString::fromLocal8Bit("检测到 %1 个雷达设备，正在配置地址...").arg(devices.size()));
-    }
-
-    QTimer::singleShot(5000, this, [this]() {
-        for (RadarDevice* d : devices)
-        {
-            connect(d->timer, &QTimer::timeout, this, [this, d]() {
-                sendReadAllChannels(d);
-                });
-            d->timer->start(50);           // 每100ms采集一次
-            sendReadAllChannels(d);         // 立即发一次
-        }
-        });
+    qDebug() << "Move started in main thread:" << QThread::currentThreadId();
 }
 
-void FormRobotPilot::broadcastSetAddress(RadarDevice* dev, quint8 newAddr)
+void FormRobotPilot::onMoveCompleted(bool success, QString message)
 {
-    QByteArray cmd;
-    cmd.append(char(0xFF));  // 广播地址
-    cmd.append(char(0x06));
-    cmd.append(char(0x00));
-    cmd.append(char(0x15));
-    cmd.append(char(0x00));
-    cmd.append(char(newAddr));
+    qDebug() << "Move completed in main thread:" << QThread::currentThreadId()
+             << "Success:" << success << "Message:" << message;
 
-    quint16 crc = modbusCRC16(cmd);
-    cmd.append(char(crc & 0xFF));
-    cmd.append(char(crc >> 8));
-
-    dev->recvBuffer.clear();
-    dev->serial->write(cmd);
-
-    ui->textEditLog->append(QString::fromLocal8Bit("[%1] 广播设置地址 → 0x%2")
-        .arg(dev->portName).arg(newAddr, 2, 16, QChar('0')));
-
-    QTimer::singleShot(800, this, [this, dev, newAddr]() {
-        dev->addressSet = true;  // 广播无返回，强制认为成功
-        ui->textEditLog->append(QString::fromLocal8Bit("[%1] 地址设置完成（广播模式）→ 0x%2")
-            .arg(dev->portName).arg(newAddr, 2, 16, QChar('0')));
-
-        bool allSet = true;
-        for (RadarDevice* d : devices) 
-            if (!d->addressSet) 
-                allSet = false;
-
-        if (allSet) 
-        {
-            ui->textEditLog->append(QString::fromLocal8Bit("所有雷达设备配置完成，可开始采集！"));
-        }
-
-        });
-
-    m_RadarTimer->start(500);
-}
-
-quint16 FormRobotPilot::modbusCRC16(const QByteArray& data)
-{
-    quint16 crc = 0xFFFF;
-    for (int i = 0; i < data.size(); ++i) {
-        crc ^= (quint8)data[i];
-        for (int j = 0; j < 8; ++j) {
-            if (crc & 1)
-                crc = (crc >> 1) ^ 0xA001;
-            else
-                crc >>= 1;
-        }
+    if (!success) {
+        RDK->ShowMessage(message, false);
     }
-    return crc;
-}
-
-void FormRobotPilot::sendReadAllChannels(RadarDevice* dev)
-{
-    if (!dev->addressSet) return;
-
-    QByteArray cmd;
-    cmd.append(char(dev->slaveAddress));
-    cmd.append(char(0x03));
-    cmd.append(char(0x00));
-    cmd.append(char(0x10));
-    cmd.append(char(0x00));
-    cmd.append(char(0x04));
-
-    quint16 crc = modbusCRC16(cmd);
-    cmd.append(char(crc & 0xFF));
-    cmd.append(char(crc >> 8));
-
-    dev->recvBuffer.clear();
-
-    dev->serial->write(cmd);
-}
-
-void FormRobotPilot::onDeviceReadyRead(RadarDevice* dev)
-{
-    dev->recvBuffer += dev->serial->readAll();
-
-    if (dev->recvBuffer.size() < 13) 
-        return;
-
-    if ((quint8)dev->recvBuffer[0] != dev->slaveAddress || (quint8)dev->recvBuffer[1] != 0x03 || (quint8)dev->recvBuffer[2] != 0x08)
-    {
-        dev->recvBuffer.clear();
-        return;
-    }
-
-    quint16 crcCalc = modbusCRC16(dev->recvBuffer.left(dev->recvBuffer.size() - 2));
-    quint16 crcRecv = (quint8)dev->recvBuffer[dev->recvBuffer.size() - 2] | ((quint8)dev->recvBuffer[dev->recvBuffer.size() - 1] << 8);
-
-    if (crcCalc != crcRecv)
-    {
-        //ui->textEditLog->append(QString::fromLocal8Bit("[%1] CRC校验失败").arg(dev->portName));
-        dev->recvBuffer.clear();
-        return;
-    }
-
-    qint32 ch[4];
-    for (int i = 0; i < 4; ++i) 
-    {
-        ch[i] = ((quint8)dev->recvBuffer[3 + i * 2] << 8) | (quint8)dev->recvBuffer[4 + i * 2];
-    }
-
-    // 判断是否触发安全停止
-    bool tooClose = false;
-    for (int i = 0; i < 4; ++i)
-    {
-        if (ch[i] > 0 && ch[i] < m_Distance)
-        {
-            tooClose = true;
-            break;
-        }
-    }
-
-    if(tooClose)
-    {
-        m_nRadarNum ++;
-        ui->textEditLog->append(dev->RobotName + ":"
-		+ QString::number(ch[0])
-		+ QString::fromLocal8Bit("、")
-		+ QString::number(ch[1])
-		+ QString::fromLocal8Bit("、")
-		+ QString::number(ch[2])
-		+ QString::fromLocal8Bit("、")
-		+ QString::number(ch[3]) + "\n" + QString::number(m_nRadarNum));
-
-    }
-
-    //if (m_nRadarNum >= 5)
-    //{
-    //    // 处理雷达触发后事件
-    //    if (dev->RobotName.contains(QString::fromLocal8Bit("一号")))
-    //    {
-    //        // 一号机械臂触发急停
-    //        ui->textEditLog->append(QString::fromLocal8Bit("一号机械臂距离过近触发急停"));
-    //        if(m_StopType == 2)
-    //        {
-	   //         m_Radarsocket->write("Light:5;");
-    //        }
-    //        else
-    //        {
-    //            m_Radarsocket->write("Light:2;");
-    //        }
-    //    }
-    //    else
-    //    {
-    //        // 二号机械臂触发急停
-    //        ui->textEditLog->append(QString::fromLocal8Bit("二号机械臂距离过近触发急停"));
-    //        if (m_StopType == 2)
-    //        {
-    //            m_Radarsocket->write("Light:5;");
-    //        }
-    //        else
-    //        {
-    //            m_Radarsocket->write("Light:1;");
-    //        }
-    //    }
-    //}
-
-    dev->recvBuffer.clear();
+    RDK->Render();
 }

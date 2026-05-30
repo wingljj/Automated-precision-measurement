@@ -1,0 +1,39 @@
+# Build outputs
+build/
+debug/
+release/
+Makefile
+Makefile.Debug
+Makefile.Release
+*.obj
+*.o
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.tlog
+*.recipe
+*.log
+
+# Qt generated files and IDE state
+ui_*.h
+moc_*.cpp
+qrc_*.cpp
+*.pro.user*
+*.vcxproj.user
+*.qtvscr
+.qmake.stash
+.qtc_clangd/
+
+# Local assistant/tooling state
+.claude/
+.codebuddy/
+superpowers/
+docs/superpowers/
+tmpclaude-*-cwd
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
