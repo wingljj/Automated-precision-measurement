@@ -5,7 +5,10 @@
 #include <QTimer>
 #include <QTcpServer>
 #include <QTcpSocket>
+#include <QLineEdit>
+#include <QList>
 #include <QMetaType>
+#include <QStringList>
 #include <QTextCursor>
 #include <QTextDocument>
 #include <cmath>
@@ -37,6 +40,10 @@ FormRobotPilot::FormRobotPilot(RoboDK *rdk, QWidget *parent) : QWidget(parent),
     , m_Distance(600)
     , m_StopType(1)
     , m_nRadarNum(0)
+    , m_RadarPort(7)
+    , m_RadarHost("169.254.0.66")
+    , m_RadarResumeCommand("Light:3;")
+    , m_RadarStopCommand("Light:5;")
     , m_isAllRobot(false)
 	, m_bIsRealRobot(false)
 {
@@ -106,12 +113,9 @@ FormRobotPilot::FormRobotPilot(RoboDK *rdk, QWidget *parent) : QWidget(parent),
     ui->labelClientStatus->setText("No client connected");
 
     m_CurrentPath = QCoreApplication::applicationDirPath();
+    GetDistance();
 
     m_Radarsocket = new QTcpSocket(this);
-
-	m_Radarsocket->connectToHost("169.254.0.66", 7);
-
-    m_Radarsocket->write("Light:3;");
 
     connect(m_Radarsocket, &QTcpSocket::connected, this, &FormRobotPilot::RonConnected);
     connect(m_Radarsocket, &QTcpSocket::disconnected, this, &FormRobotPilot::RonDisconnected);
@@ -119,7 +123,7 @@ FormRobotPilot::FormRobotPilot(RoboDK *rdk, QWidget *parent) : QWidget(parent),
     connect(m_Radarsocket, QOverload<QAbstractSocket::SocketError>::of(&QAbstractSocket::errorOccurred),
         this, &FormRobotPilot::RonError);
 
-    GetDistance();
+	m_Radarsocket->connectToHost(m_RadarHost, static_cast<quint16>(m_RadarPort));
 
     // 创建工作线程1
     m_workerThread1 = new QThread(this);
@@ -700,36 +704,36 @@ void FormRobotPilot::onReadyRead()
                         {
                             // 工具坐标系运动
                             ui->radCartesianTool->click();
-                            moveToCartesian(values);
-                            m_clientSocket->write("Tool move executed");
+                            bool accepted = moveToCartesian(values);
+                            m_clientSocket->write(accepted ? "Tool move accepted" : "Tool move rejected");
                         } 
                         else if (mode == "T1")
                         {
                             // 工具坐标系运动
                             ui->radCartesianTool->click();
-                            Robot1moveToCartesian(values);
-                            m_clientSocket->write("Tool move executed");
+                            bool accepted = Robot1moveToCartesian(values);
+                            m_clientSocket->write(accepted ? "Tool move accepted" : "Tool move rejected");
                         }
                         else if (mode == "T2")
                         {
                             // 工具坐标系运动
                             ui->radCartesianTool->click();
-                            Robot2moveToCartesian(values);
-                            m_clientSocket->write("Tool move executed");
+                            bool accepted = Robot2moveToCartesian(values);
+                            m_clientSocket->write(accepted ? "Tool move accepted" : "Tool move rejected");
                         }
                         else if (mode == "R") 
                         {
                             // 参考坐标系运动
                             ui->radCartesianReference->click();
-                            moveToCartesian(values);
-                            m_clientSocket->write("Reference move executed");
+                            bool accepted = moveToCartesian(values);
+                            m_clientSocket->write(accepted ? "Reference move accepted" : "Reference move rejected");
                         }
                         else if (mode == "J") 
                         {
                             // 关节空间运动
                             ui->radJoints->click();
-                            moveToJoints(values);
-                            m_clientSocket->write("Joints move executed");
+                            bool accepted = moveToJoints(values);
+                            m_clientSocket->write(accepted ? "Joints move accepted" : "Joints move rejected");
                         }
                         else 
                         {
@@ -1217,7 +1221,7 @@ void FormRobotPilot::Slot_BtnStop()
         if (m_Radarsocket)
         {
             ui->textEditLog->append(QString::fromLocal8Bit("点击恢复按钮"));
-            m_Radarsocket->write("Light:3;");
+            SendRadarCommand(m_RadarResumeCommand);
         }
     }
     else
@@ -1234,7 +1238,7 @@ void FormRobotPilot::Slot_BtnStop()
         if (m_Radarsocket)
         {
             ui->textEditLog->append(QString::fromLocal8Bit("点击急停按钮"));
-            m_Radarsocket->write("Light:5;");
+            SendRadarCommand(m_RadarStopCommand);
         }
     }
 }
@@ -1248,6 +1252,7 @@ void FormRobotPilot::Slot_LineEdit(const QString& Text)
 void FormRobotPilot::RonConnected()
 {
     ui->textEditLog->append(QString::fromLocal8Bit("测录雷达急停控制器连接成功"));
+    SendRadarCommand(m_RadarResumeCommand);
 }
 
 void FormRobotPilot::RonDisconnected()
@@ -1299,7 +1304,7 @@ void FormRobotPilot::Slot_RadarTimeOut()
 {
     if(m_nRadarNum >= 5)
     {
-        m_Radarsocket->write("Light:5;");
+        SendRadarCommand(m_RadarStopCommand);
         ui->textEditLog->append(QString::fromLocal8Bit("机械臂距离过近触发急停"));
         m_nRadarNum = 0;
     }
@@ -1553,8 +1558,6 @@ bool FormRobotPilot::PlanningPosition(QVector<double>& target)
 
     // 步骤1: 获取/切换到指定 Robot（使用您的 GetRobotByName）
     Item baseFrame = RDK->getItem(m_MapRobotAndBase.value(Robot->Name()), IItem::ITEM_TYPE_FRAME);
-    int mode = ui->radCartesianReference->isChecked() ? 0 :
-        (ui->radCartesianTool->isChecked() ? 1 : 2);
     qDebug() << QString::fromLocal8Bit("可达性判断");
     std::vector<PoseWithIndex> posesWithIndex = m_MapTargetPoints.value(Robot);
     // 笛卡尔模式：使用 Mat (位姿)
@@ -1817,6 +1820,54 @@ bool FormRobotPilot::SetSpeed(double speed_linear, double speed_joints, double a
     return true;
 }
 
+bool FormRobotPilot::ReadTargetInputs(QVector<double>& target)
+{
+    target.clear();
+
+    const QList<QLineEdit*> fields = {
+        ui->lineEdit_X_2,
+        ui->lineEdit_Y_2,
+        ui->lineEdit_Z_2,
+        ui->lineEdit_Rx_2,
+        ui->lineEdit_Ry_2,
+        ui->lineEdit_Rz_2
+    };
+    const QStringList names = { "X", "Y", "Z", "Rx", "Ry", "Rz" };
+
+    for (int i = 0; i < fields.size(); ++i)
+    {
+        bool ok = false;
+        QString text = fields[i]->text().trimmed();
+        double value = text.toDouble(&ok);
+        if (text.isEmpty() || !ok)
+        {
+            QString message = QString::fromLocal8Bit("目标参数无效：%1").arg(names[i]);
+            ui->textEditLog->append(message);
+            RDK->ShowMessage(message, false);
+            return false;
+        }
+        target.append(value);
+    }
+
+    return target.size() == 6;
+}
+
+void FormRobotPilot::SendRadarCommand(const QString& command)
+{
+    if (!m_Radarsocket || command.isEmpty())
+    {
+        return;
+    }
+
+    if (m_Radarsocket->state() != QAbstractSocket::ConnectedState)
+    {
+        ui->textEditLog->append(QString::fromLocal8Bit("雷达控制器未连接，命令未发送：") + command);
+        return;
+    }
+
+    m_Radarsocket->write(command.toLocal8Bit());
+}
+
 /**
  * @brief 处理客户端断开连接
  */
@@ -1836,20 +1887,11 @@ void FormRobotPilot::onClientDisconnected()
  */
 void FormRobotPilot::on_btnPlanning_clicked()
 {
-    if (ui->lineEdit_X_2->text().isEmpty() || ui->lineEdit_Y_2->text().isEmpty()
-        || ui->lineEdit_Z_2->text().isEmpty() || ui->lineEdit_Rx_2->text().isEmpty()
-        || ui->lineEdit_Ry_2->text().isEmpty() || ui->lineEdit_Rz_2->text().isEmpty())
+    QVector<double> target;
+    if (!ReadTargetInputs(target))
     {
         return;
     }
-    // 获取当前LineEdit中的坐标值
-    QVector<double> target(6);
-    target[0] = ui->lineEdit_X_2->text().toDouble();
-    target[1] = ui->lineEdit_Y_2->text().toDouble();
-    target[2] = ui->lineEdit_Z_2->text().toDouble();
-    target[3] = ui->lineEdit_Rx_2->text().toDouble();
-    target[4] = ui->lineEdit_Ry_2->text().toDouble();
-    target[5] = ui->lineEdit_Rz_2->text().toDouble();
 
     if (PlanningPosition(target))
     {
@@ -1867,22 +1909,14 @@ void FormRobotPilot::on_btnPlanning_clicked()
 void FormRobotPilot::on_btnExecute_clicked()
 {
     QVector<double> target;
-    if (ui->lineEdit_X_2->text().isEmpty() || ui->lineEdit_Y_2->text().isEmpty()
-        || ui->lineEdit_Z_2->text().isEmpty() || ui->lineEdit_Rx_2->text().isEmpty()
-        || ui->lineEdit_Ry_2->text().isEmpty() || ui->lineEdit_Rz_2->text().isEmpty())
+    if (!ReadTargetInputs(target))
     {
         return;
     }
-    target.append(ui->lineEdit_X_2->text().toDouble());
-    target.append(ui->lineEdit_Y_2->text().toDouble());
-    target.append(ui->lineEdit_Z_2->text().toDouble());
-    target.append(ui->lineEdit_Rx_2->text().toDouble());
-    target.append(ui->lineEdit_Ry_2->text().toDouble());
-    target.append(ui->lineEdit_Rz_2->text().toDouble());
-    bool moveSuccess;
 
     qDebug() << QString::fromLocal8Bit("按钮执行");
 
+    bool moveSuccess = false;
     if (ui->radJoints->isChecked())
     {
         moveSuccess = moveToJoints(target);
@@ -1890,6 +1924,11 @@ void FormRobotPilot::on_btnExecute_clicked()
     else
     {
         moveSuccess = moveToCartesian(target);
+    }
+
+    if (!moveSuccess)
+    {
+        ui->textEditLog->append(QString::fromLocal8Bit("执行失败"));
     }
 }
 
@@ -2350,6 +2389,17 @@ void FormRobotPilot::GetDistance()
     m_Robot1ComNum = settings.value("ComNumRobot1", "").toString();
     m_Robot2ComNum = settings.value("ComNumRobot2", "").toString();
     settings.endGroup();
+    settings.beginGroup("RadarController");
+    m_RadarHost = settings.value("host", m_RadarHost).toString();
+    m_RadarPort = settings.value("port", m_RadarPort).toInt();
+    m_RadarResumeCommand = settings.value("resumeCommand", m_RadarResumeCommand).toString();
+    m_RadarStopCommand = settings.value("stopCommand", m_RadarStopCommand).toString();
+    settings.endGroup();
+    if (m_RadarPort <= 0 || m_RadarPort > 65535)
+    {
+        ui->textEditLog->append(QString::fromLocal8Bit("雷达控制器端口无效，使用默认端口 7"));
+        m_RadarPort = 7;
+    }
     ui->lineEdit_RadarDistance->setText(QString::number(m_Distance));
 }
 
@@ -2370,6 +2420,14 @@ void FormRobotPilot::onMoveCompleted(bool success, QString message)
 {
     qDebug() << "Move completed in main thread:" << QThread::currentThreadId()
              << "Success:" << success << "Message:" << message;
+
+    if (m_clientSocket)
+    {
+        QString clientMessage = success
+            ? QString("Move completed: %1").arg(message)
+            : QString("Move failed: %1").arg(message);
+        m_clientSocket->write(clientMessage.toLocal8Bit());
+    }
 
     if (!success) {
         RDK->ShowMessage(message, false);

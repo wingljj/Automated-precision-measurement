@@ -22,6 +22,21 @@ The main remaining risk is that `RoboDK*` and `Item` API calls are made from bot
 
 ## Issue Backlog
 
+GitHub issue mapping:
+
+| ID | GitHub Issue | Status After First Optimization Pass |
+| --- | --- | --- |
+| APM-001 | #1 | Open; requires RoboDK/robot-controller hard-stop API confirmation |
+| APM-002 | #2 | Open; requires threading contract or command executor design |
+| APM-003 | #3 | Open; authentication and schema migration not implemented |
+| APM-004 | #4 | Partially optimized; accepted/rejected and completion messages added, request ids still needed |
+| APM-005 | #5 | Partially optimized; radar endpoint/commands configurable, typed adapter still needed |
+| APM-006 | #6 | Open; external dependency still required |
+| APM-007 | #7 | Open; project output paths still need release redesign |
+| APM-008 | #8 | Optimized in UI button paths; future protocol schema work remains under #3 |
+| APM-009 | #9 | Optimized in touched paths |
+| APM-010 | #10 | Monitoring; ignore policy is in place |
+
 ### APM-001: Define a hard-stop path for active real-robot motion
 
 Priority: P0

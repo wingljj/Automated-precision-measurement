@@ -109,11 +109,19 @@ distance=600
 
 [EStop]
 stoptype=1
+
+[RadarComMap]
 ComNumRobot1=
 ComNumRobot2=
+
+[RadarController]
+host=169.254.0.66
+port=7
+resumeCommand=Light:3;
+stopCommand=Light:5;
 ```
 
-The radar controller endpoint is currently hard-coded in code as `169.254.0.66:7`. Moving this to configuration is tracked in `docs/ISSUES_REVIEW.md`.
+`RadarController` values default to the controller endpoint and light commands used by the original deployment. Override them in `config.ini` for each cell instead of editing source code.
 
 ## TCP Command Protocol
 
@@ -150,6 +158,8 @@ E_T2_<x>_<y>_<z>_<rx>_<ry>_<rz>    # Tool-frame Cartesian move, Robot2
 E_R_<x>_<y>_<z>_<rx>_<ry>_<rz>     # Reference-frame Cartesian move
 E_J_<j1>_<j2>_<j3>_<j4>_<j5>_<j6>  # Joint move
 ```
+
+Movement commands return an immediate `accepted` or `rejected` response. Real-robot worker completion is reported later as `Move completed: ...` or `Move failed: ...`.
 
 ### Planning
 
@@ -205,7 +215,7 @@ M_List
 - Always validate movement in RoboDK simulation first.
 - Keep physical emergency-stop hardware in the loop for real robots.
 - The current TCP server is bound to localhost, but it does not authenticate clients.
-- Immediate movement responses currently mean the command was accepted, not necessarily that the robot has completed the move.
+- Immediate movement responses mean the command was accepted or rejected. Completion is reported separately when the worker finishes.
 - Active `MoveJ` interruption depends on RoboDK/robot-controller behavior and needs a dedicated hard-stop implementation.
 
 ## Known Issues

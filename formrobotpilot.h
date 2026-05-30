@@ -82,6 +82,9 @@ private:
 
     bool SetSpeed(double speed_linear, double speed_joints, double accel_linear, double accel_joints);
 
+    bool ReadTargetInputs(QVector<double>& target);
+    void SendRadarCommand(const QString& command);
+
     // 新增功能方法
     void ClearAllTargets();  // 清空所有目标点
     QString GetToolPosition();  // 获取工具坐标位置
@@ -197,6 +200,11 @@ private:
     int m_Distance;
     int m_StopType;
     int m_nRadarNum;
+    int m_RadarPort;
+
+    QString m_RadarHost;
+    QString m_RadarResumeCommand;
+    QString m_RadarStopCommand;
 
     bool m_isAllRobot, m_bIsRealRobot;
 
