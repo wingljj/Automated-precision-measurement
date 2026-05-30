@@ -29,6 +29,9 @@ The current plugin target is `PluginExample.dll`, loaded by RoboDK from the Robo
 |-- resources/                  # Plugin icons
 |-- resources1.qrc              # Qt resource file
 |-- docs/ISSUES_REVIEW.md       # Review findings and issue backlog
+|-- docs/OPTIMIZATION_REVIEW.md # First optimization review
+|-- docs/SAFETY_THREADING_REVIEW.md # Safety/threading follow-up review
+|-- issues/                     # Mirrored bug reports for GitHub issues
 `-- manifest.xml                # RoboDK plugin manifest
 ```
 
@@ -173,6 +176,8 @@ P_T_<x>_<y>_<z>_<rx>_<ry>_<rz>
 M_Speed_<linearSpeed>_<jointSpeed>_<linearAccel>_<jointAccel>
 ```
 
+In real-robot mode, the immediate TCP response is `Speed command accepted`. The worker then reports speed confirmation separately. Real movement is rejected until the relevant robot/worker has confirmed speed after entering real mode, changing robot selection, or recovering from stop.
+
 The current hard caps are:
 
 - Linear speed: `2000`
@@ -213,17 +218,22 @@ M_List
 
 - Treat this software as an operator aid, not as a safety-rated controller.
 - Always validate movement in RoboDK simulation first.
+- After enabling real-robot mode, set speed before sending any physical movement command.
+- Manual stop, radar stop, robot reselection, and real-mode entry clear the speed authorization state.
 - Keep physical emergency-stop hardware in the loop for real robots.
 - The current TCP server is bound to localhost, but it does not authenticate clients.
 - Immediate movement responses mean the command was accepted or rejected. Completion is reported separately when the worker finishes.
+- Planning, execute, and real/sim mode controls are disabled while worker motion is active.
 - Active `MoveJ` interruption depends on RoboDK/robot-controller behavior and needs a dedicated hard-stop implementation.
 
 ## Known Issues
 
-See `docs/ISSUES_REVIEW.md` for the current review backlog. Highest-priority items:
+See `docs/ISSUES_REVIEW.md` and `docs/SAFETY_THREADING_REVIEW.md` for the current review backlog. Highest-priority items:
 
 - Define and test a real hard-stop path for active robot motion.
 - Serialize or otherwise prove safe RoboDK API access across UI and worker threads.
+- Add a complete real-robot arming/workflow state around RoboDK physical communication.
+- Improve hardware-level speed acknowledgement beyond worker-return confirmation.
 - Add authentication and request/response ids to the TCP protocol.
 - Vendor or document the required `robodk_interface` dependency.
 

@@ -84,6 +84,11 @@ private:
 
     bool ReadTargetInputs(QVector<double>& target);
     void SendRadarCommand(const QString& command);
+    bool CanStartRealMove(Item robot, const QString& robotLabel, QAtomicInt& movingFlag, const QAtomicInt& speedConfigured);
+    void ResetRealRobotSpeedState(const QString& reason);
+    void HandleSpeedConfigured(int workerId, bool success, const QString& message);
+    void UpdateMotionControls();
+    void LogWorkflowState(const QString& message);
 
     // 新增功能方法
     void ClearAllTargets();  // 清空所有目标点
@@ -215,6 +220,8 @@ private:
     RobotWorker* m_robotWorker2;
     QAtomicInt m_robot1Moving;
     QAtomicInt m_robot2Moving;
+    QAtomicInt m_robot1SpeedConfigured;
+    QAtomicInt m_robot2SpeedConfigured;
     QByteArray m_tcpRecvBuffer;
 
     // QVector<QString> m_VecComNum;

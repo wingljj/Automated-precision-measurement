@@ -32,13 +32,14 @@ void RobotWorker::setStopRequested(bool stop)
 void RobotWorker::executeSetSpeed(Item robot, double speed_linear, double speed_joints, double accel_linear, double accel_joints)
 {
     if (!robot) {
-        emit moveCompleted(false, "Invalid robot object");
+        emit speedConfigured(false, "Invalid robot object");
         return;
     }
 
     robot->setSpeed(speed_linear, speed_joints, accel_linear, accel_joints);
     qDebug() << "Speed set in thread:" << QThread::currentThreadId()
              << speed_linear << speed_joints << accel_linear << accel_joints;
+    emit speedConfigured(true, "Speed configured");
 }
 
 void RobotWorker::executeMoveCartesian(Item robot, QVector<double> xyzwpr, int mode)
@@ -102,6 +103,11 @@ void RobotWorker::executeMoveJoints(Item robot, QVector<double> joints)
         return;
     }
 
+    if (joints.size() != 6) {
+        emit moveCompleted(false, "Invalid joint parameters");
+        return;
+    }
+
     if (!m_rdk) {
         emit moveCompleted(false, "Invalid RoboDK connection");
         return;
@@ -110,7 +116,7 @@ void RobotWorker::executeMoveJoints(Item robot, QVector<double> joints)
     emit moveStarted();
 
     tJoints robot_joints;
-    for (int i = 0; i < qMin(joints.size(), 6); i++) {
+    for (int i = 0; i < 6; i++) {
         robot_joints.Data()[i] = joints[i];
     }
 

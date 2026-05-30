@@ -33,6 +33,8 @@ FormRobotPilot::FormRobotPilot(RoboDK *rdk, QWidget *parent) : QWidget(parent),
     , m_Stop(0)
     , m_robot1Moving(0)
     , m_robot2Moving(0)
+    , m_robot1SpeedConfigured(0)
+    , m_robot2SpeedConfigured(0)
     , m_workerThread1(nullptr)
     , m_workerThread2(nullptr)
     , m_robotWorker1(nullptr)
@@ -151,6 +153,11 @@ FormRobotPilot::FormRobotPilot(RoboDK *rdk, QWidget *parent) : QWidget(parent),
     connect(m_robotWorker1, &RobotWorker::moveStarted,
             this, &FormRobotPilot::onMoveStarted,
             Qt::QueuedConnection);
+    connect(m_robotWorker1, &RobotWorker::speedConfigured,
+            this, [this](bool success, QString message) {
+                HandleSpeedConfigured(1, success, message);
+            },
+            Qt::QueuedConnection);
     connect(m_workerThread1, &QThread::finished,
             m_robotWorker1, &QObject::deleteLater);
 
@@ -182,6 +189,11 @@ FormRobotPilot::FormRobotPilot(RoboDK *rdk, QWidget *parent) : QWidget(parent),
     connect(m_robotWorker2, &RobotWorker::moveStarted,
             this, &FormRobotPilot::onMoveStarted,
             Qt::QueuedConnection);
+    connect(m_robotWorker2, &RobotWorker::speedConfigured,
+            this, [this](bool success, QString message) {
+                HandleSpeedConfigured(2, success, message);
+            },
+            Qt::QueuedConnection);
     connect(m_workerThread2, &QThread::finished,
             m_robotWorker2, &QObject::deleteLater);
 
@@ -200,6 +212,9 @@ FormRobotPilot::FormRobotPilot(RoboDK *rdk, QWidget *parent) : QWidget(parent),
  */
 FormRobotPilot::~FormRobotPilot()
 {
+    m_Stop.storeRelaxed(1);
+    emit requestStop(true);
+
     // 停止工作线程
     if (m_workerThread1) {
         m_workerThread1->quit();
@@ -299,6 +314,7 @@ bool FormRobotPilot::SelectRobot()
     if (robot_is_selected)
     {
         ui->lblRobot->setText(QString::fromLocal8Bit("已选择机器人: ") + Robot->Name());  // 显示选择的机器人名称
+        ResetRealRobotSpeedState(QString::fromLocal8Bit("机器人选择已改变"));
     }
     else
     {
@@ -1048,7 +1064,7 @@ void FormRobotPilot::onReadyRead()
                         }
                         else if (SetSpeed(speedLinear, speedJoints, accelLinear, accelJoints))
                         {
-                            m_clientSocket->write("Speed set");
+                            m_clientSocket->write("Speed command accepted");
                         }
                         else
                         {
@@ -1228,6 +1244,7 @@ void FormRobotPilot::Slot_BtnStop()
     {
         // 触发急停
         m_Stop.storeRelaxed(1);
+        ResetRealRobotSpeedState(QString::fromLocal8Bit("急停已触发"));
         emit requestStop(true);
         qDebug() << "Stop requested from main thread";
         ui->btn_Stop->setText(QString::fromLocal8Bit("恢复"));
@@ -1268,6 +1285,7 @@ void FormRobotPilot::RonReadyRead()
     {
         ui->textEditLog->append(QString::fromLocal8Bit("一、二号机械臂急停"));
         m_Stop.storeRelaxed(1);
+        ResetRealRobotSpeedState(QString::fromLocal8Bit("雷达急停已触发"));
         emit requestStop(true);
         ui->btn_Stop->setText(QString::fromLocal8Bit("恢复"));
     }
@@ -1275,6 +1293,7 @@ void FormRobotPilot::RonReadyRead()
     {
         ui->textEditLog->append(QString::fromLocal8Bit("二号机械臂急停"));
         m_Stop.storeRelaxed(1);
+        ResetRealRobotSpeedState(QString::fromLocal8Bit("雷达急停已触发"));
         emit requestStop(true);
         ui->btn_Stop->setText(QString::fromLocal8Bit("恢复"));
     }
@@ -1282,6 +1301,7 @@ void FormRobotPilot::RonReadyRead()
     {
         ui->textEditLog->append(QString::fromLocal8Bit("一号机械臂急停"));
         m_Stop.storeRelaxed(1);
+        ResetRealRobotSpeedState(QString::fromLocal8Bit("雷达急停已触发"));
         emit requestStop(true);
         ui->btn_Stop->setText(QString::fromLocal8Bit("恢复"));
     }
@@ -1304,6 +1324,10 @@ void FormRobotPilot::Slot_RadarTimeOut()
 {
     if(m_nRadarNum >= 5)
     {
+        m_Stop.storeRelaxed(1);
+        ResetRealRobotSpeedState(QString::fromLocal8Bit("距离过近急停已触发"));
+        emit requestStop(true);
+        ui->btn_Stop->setText(QString::fromLocal8Bit("恢复"));
         SendRadarCommand(m_RadarStopCommand);
         ui->textEditLog->append(QString::fromLocal8Bit("机械臂距离过近触发急停"));
         m_nRadarNum = 0;
@@ -1330,15 +1354,13 @@ bool FormRobotPilot::moveToCartesian(const QVector<double>& values)
 
     if(m_bIsRealRobot)
     {
-        if (m_Stop.loadRelaxed() == 1) {
-            RDK->ShowMessage(QString::fromLocal8Bit("急停状态下禁止运动"), false);
+        if (!CanStartRealMove(Robot,
+                              QString::fromLocal8Bit("当前机械臂"),
+                              m_robot1Moving,
+                              m_robot1SpeedConfigured))
+        {
             return false;
         }
-        if (m_robot1Moving.loadRelaxed() == 1) {
-            qDebug() << "Worker1 is already moving";
-            return false;
-        }
-        m_robot1Moving.storeRelaxed(1);
         int mode = ui->radCartesianReference->isChecked() ? 0 :
            (ui->radCartesianTool->isChecked() ? 1 : 2);
 		emit requestMoveCartesianWorker1(Robot, values, mode);
@@ -1399,15 +1421,13 @@ bool FormRobotPilot::Robot1moveToCartesian(const QVector<double>& values)
 
     if(m_bIsRealRobot)
     {
-        if (m_Stop.loadRelaxed() == 1) {
-            RDK->ShowMessage(QString::fromLocal8Bit("急停状态下禁止运动"), false);
+        if (!CanStartRealMove(Robot1,
+                              "Robot1",
+                              m_robot1Moving,
+                              m_robot1SpeedConfigured))
+        {
             return false;
         }
-        if (m_robot1Moving.loadRelaxed() == 1) {
-            qDebug() << "Robot1 is already moving";
-            return false;
-        }
-        m_robot1Moving.storeRelaxed(1);
         emit requestMoveCartesianWorker1(Robot1, values, mode);
     }
     else
@@ -1465,15 +1485,13 @@ bool FormRobotPilot::Robot2moveToCartesian(const QVector<double>& values)
                (ui->radCartesianTool->isChecked() ? 1 : 2);
     if(m_bIsRealRobot)
     {
-        if (m_Stop.loadRelaxed() == 1) {
-            RDK->ShowMessage(QString::fromLocal8Bit("急停状态下禁止运动"), false);
+        if (!CanStartRealMove(Robot2,
+                              "Robot2",
+                              m_robot2Moving,
+                              m_robot2SpeedConfigured))
+        {
             return false;
         }
-        if (m_robot2Moving.loadRelaxed() == 1) {
-            qDebug() << "Robot2 is already moving";
-            return false;
-        }
-        m_robot2Moving.storeRelaxed(1);
         emit requestMoveCartesianWorker2(Robot2, values, mode);
     }
     else
@@ -1529,15 +1547,29 @@ bool FormRobotPilot::moveToJoints(const QVector<double>& values)
         RDK->ShowMessage(QString::fromLocal8Bit("关节参数错误"), false);
         return false;
     }
-    if (m_Stop.loadRelaxed() == 1) {
-        RDK->ShowMessage(QString::fromLocal8Bit("急停状态下禁止运动"), false);
-        return false;
+    if (m_bIsRealRobot)
+    {
+        if (!CanStartRealMove(Robot,
+                              QString::fromLocal8Bit("当前机械臂"),
+                              m_robot1Moving,
+                              m_robot1SpeedConfigured))
+        {
+            return false;
+        }
     }
-    if (m_robot1Moving.loadRelaxed() == 1) {
-        qDebug() << "Worker1 is already moving";
-        return false;
+    else
+    {
+        if (m_Stop.loadRelaxed() == 1) {
+            RDK->ShowMessage(QString::fromLocal8Bit("急停状态下禁止运动"), false);
+            return false;
+        }
+        if (m_robot1Moving.loadRelaxed() == 1) {
+            qDebug() << "Worker1 is already moving";
+            return false;
+        }
+        m_robot1Moving.storeRelaxed(1);
+        UpdateMotionControls();
     }
-    m_robot1Moving.storeRelaxed(1);
     emit requestMoveJointsWorker1(Robot, values);
     return true;
 }
@@ -1683,6 +1715,7 @@ bool FormRobotPilot::SelectRobotByName(const QString& name)
         QString RobotName = Robot->Name();
         ui->lblRobot->setText(QString::fromLocal8Bit("已选择机器人: ") + RobotName);
         RDK->ShowMessage(tr("Robot selected: ") + name, false);
+        ResetRealRobotSpeedState(QString::fromLocal8Bit("机器人选择已改变"));
         // 更新当前关节/位姿显示
         updateCartesianPosition();
         QStringList AllName = RDK->getItemListNames(IItem::ITEM_TYPE_FRAME);
@@ -1758,6 +1791,7 @@ bool FormRobotPilot::SelectAllRobotByNames(const QString& name1, const QString& 
     ui->label_Robot1->show();
     ui->label_ZBX->show();
     m_isAllRobot = true;
+    ResetRealRobotSpeedState(QString::fromLocal8Bit("机器人选择已改变"));
     return true;
 }
 
@@ -1768,18 +1802,20 @@ bool FormRobotPilot::SetSpeed(double speed_linear, double speed_joints, double a
         speed_linear <= 0.0 || speed_joints <= 0.0 ||
         accel_linear < 0.0 || accel_joints < 0.0)
     {
+        ResetRealRobotSpeedState(QString::fromLocal8Bit("速度参数无效"));
         ui->textEditLog->append(QString::fromLocal8Bit("速度参数无效，已拒绝"));
         return false;
     }
     if (speed_linear > kMaxLinearSpeed || speed_joints > kMaxJointSpeed ||
         accel_linear > kMaxLinearAccel || accel_joints > kMaxJointAccel)
     {
+        ResetRealRobotSpeedState(QString::fromLocal8Bit("速度参数超出安全上限"));
         ui->textEditLog->append(QString::fromLocal8Bit("速度参数超出安全上限，已拒绝"));
         return false;
     }
 
     bool applied = false;
-    auto applySpeed = [&](Item robot, bool useWorker1) {
+    auto applySpeed = [&](Item robot, bool useWorker1, const QString& robotLabel) {
         if (!robot) {
             return;
         }
@@ -1788,29 +1824,38 @@ bool FormRobotPilot::SetSpeed(double speed_linear, double speed_joints, double a
         if (m_bIsRealRobot)
         {
             if (useWorker1) {
+                m_robot1SpeedConfigured.storeRelaxed(0);
                 emit requestSetSpeedWorker1(robot, speed_linear, speed_joints, accel_linear, accel_joints);
             } else {
+                m_robot2SpeedConfigured.storeRelaxed(0);
                 emit requestSetSpeedWorker2(robot, speed_linear, speed_joints, accel_linear, accel_joints);
             }
+            LogWorkflowState(QString::fromLocal8Bit("%1速度设置命令已发送，等待确认").arg(robotLabel));
         }
         else
         {
             robot->setSpeed(speed_linear, speed_joints, accel_linear, accel_joints);
+            if (useWorker1) {
+                m_robot1SpeedConfigured.storeRelaxed(1);
+            } else {
+                m_robot2SpeedConfigured.storeRelaxed(1);
+            }
         }
     };
 
     if (m_isAllRobot)
     {
-        applySpeed(Robot1, true);
-        applySpeed(Robot2, false);
+        applySpeed(Robot1, true, "Robot1");
+        applySpeed(Robot2, false, "Robot2");
     }
     else
     {
-        applySpeed(Robot, true);
+        applySpeed(Robot, true, QString::fromLocal8Bit("当前机械臂"));
     }
 
     if (!applied)
     {
+        ResetRealRobotSpeedState(QString::fromLocal8Bit("未选择有效机器人"));
         ui->textEditLog->append(QString::fromLocal8Bit("未选择有效机器人，速度未设置"));
         return false;
     }
@@ -1866,6 +1911,92 @@ void FormRobotPilot::SendRadarCommand(const QString& command)
     }
 
     m_Radarsocket->write(command.toLocal8Bit());
+}
+
+bool FormRobotPilot::CanStartRealMove(Item robot, const QString& robotLabel, QAtomicInt& movingFlag, const QAtomicInt& speedConfigured)
+{
+    if (!m_bIsRealRobot)
+    {
+        return true;
+    }
+
+    QString rejectReason;
+    if (!robot)
+    {
+        rejectReason = QString::fromLocal8Bit("%1未选择或无效").arg(robotLabel);
+    }
+    else if (m_Stop.loadRelaxed() == 1)
+    {
+        rejectReason = QString::fromLocal8Bit("急停状态下禁止真实机械臂运动");
+    }
+    else if (speedConfigured.loadRelaxed() != 1)
+    {
+        rejectReason = QString::fromLocal8Bit("%1速度未确认，禁止真实机械臂运动").arg(robotLabel);
+    }
+    else if (movingFlag.loadRelaxed() == 1)
+    {
+        rejectReason = QString::fromLocal8Bit("%1正在运动，拒绝重复下发").arg(robotLabel);
+    }
+
+    if (!rejectReason.isEmpty())
+    {
+        LogWorkflowState(QString::fromLocal8Bit("真实机械臂运动被拒绝：") + rejectReason);
+        RDK->ShowMessage(rejectReason, false);
+        if (m_clientSocket)
+        {
+            m_clientSocket->write(QString("Real move rejected: %1").arg(rejectReason).toLocal8Bit());
+        }
+        return false;
+    }
+
+    movingFlag.storeRelaxed(1);
+    UpdateMotionControls();
+    return true;
+}
+
+void FormRobotPilot::ResetRealRobotSpeedState(const QString& reason)
+{
+    m_robot1SpeedConfigured.storeRelaxed(0);
+    m_robot2SpeedConfigured.storeRelaxed(0);
+
+    if (m_bIsRealRobot && !reason.isEmpty())
+    {
+        LogWorkflowState(reason + QString::fromLocal8Bit("，请重新设置速度后再执行真实机械臂运动"));
+    }
+}
+
+void FormRobotPilot::HandleSpeedConfigured(int workerId, bool success, const QString& message)
+{
+    QAtomicInt* speedFlag = (workerId == 2) ? &m_robot2SpeedConfigured : &m_robot1SpeedConfigured;
+    speedFlag->storeRelaxed(success ? 1 : 0);
+
+    const QString robotLabel = (workerId == 2) ? "Robot2" : "Robot1";
+    const QString stateMessage = success
+        ? QString::fromLocal8Bit("%1速度已确认：%2").arg(robotLabel, message)
+        : QString::fromLocal8Bit("%1速度设置失败：%2").arg(robotLabel, message);
+
+    LogWorkflowState(stateMessage);
+    if (m_clientSocket)
+    {
+        m_clientSocket->write(stateMessage.toLocal8Bit());
+    }
+    if (!success)
+    {
+        RDK->ShowMessage(stateMessage, false);
+    }
+}
+
+void FormRobotPilot::UpdateMotionControls()
+{
+    const bool anyMoving = (m_robot1Moving.loadRelaxed() == 1 || m_robot2Moving.loadRelaxed() == 1);
+    ui->btn_Execute->setEnabled(!anyMoving);
+    ui->btn_Planning->setEnabled(!anyMoving);
+    ui->chkRunOnRobot->setEnabled(!anyMoving);
+}
+
+void FormRobotPilot::LogWorkflowState(const QString& message)
+{
+    ui->textEditLog->append("[" + QDateTime::currentDateTime().toString("hh:mm:ss") + "] " + message);
 }
 
 /**
@@ -1978,16 +2109,21 @@ void FormRobotPilot::on_chkRunOnRobot_clicked(bool checked)
 
     if (checked)
     {
+        ResetRealRobotSpeedState(QString::fromLocal8Bit("真实机械臂模式已启用"));
         RDK->setRunMode(RoboDK::RUNMODE_RUN_ROBOT);
         RDK->Render();
         RDK->ShowMessage(tr("Run Mode set to run the real robot. Make sure you are properly connected to the robot (select Connect-Connect Robot)"), false);
+        LogWorkflowState(QString::fromLocal8Bit("真实机械臂模式：请先设置速度，确认后再执行运动"));
     } 
     else 
     {
+        ResetRealRobotSpeedState(QString());
         RDK->setRunMode(RoboDK::RUNMODE_SIMULATE);
         RDK->Render();
         RDK->ShowMessage(tr("Run Mode set to simulate"), false);
+        LogWorkflowState(QString::fromLocal8Bit("已切换到仿真模式"));
     }
+    UpdateMotionControls();
 }
 
 /**
@@ -2246,6 +2382,7 @@ bool FormRobotPilot::SetActiveRobot(const QString& robotName)
         Robot = newRobot;
         ui->lblRobot->setText(QString::fromLocal8Bit("已选择机器人:\n") + robotName);
         RDK->ShowMessage(tr("Robot selected: ") + robotName, false);
+        ResetRealRobotSpeedState(QString::fromLocal8Bit("机器人选择已改变"));
         // 更新当前关节/位姿显示
         updateCartesianPosition();
         return true;
@@ -2414,12 +2551,18 @@ void FormRobotPilot::SetDistance()
 void FormRobotPilot::onMoveStarted()
 {
     qDebug() << "Move started in main thread:" << QThread::currentThreadId();
+    LogWorkflowState(QString::fromLocal8Bit("机械臂运动开始"));
+    UpdateMotionControls();
 }
 
 void FormRobotPilot::onMoveCompleted(bool success, QString message)
 {
     qDebug() << "Move completed in main thread:" << QThread::currentThreadId()
              << "Success:" << success << "Message:" << message;
+
+    LogWorkflowState(success
+        ? QString::fromLocal8Bit("机械臂运动完成：") + message
+        : QString::fromLocal8Bit("机械臂运动失败：") + message);
 
     if (m_clientSocket)
     {
@@ -2433,4 +2576,5 @@ void FormRobotPilot::onMoveCompleted(bool success, QString message)
         RDK->ShowMessage(message, false);
     }
     RDK->Render();
+    UpdateMotionControls();
 }

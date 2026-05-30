@@ -18,6 +18,7 @@ public:
 signals:
     void moveStarted();
     void moveCompleted(bool success, QString message);
+    void speedConfigured(bool success, QString message);
 
 public slots:
     void executeMoveCartesian(Item robot, QVector<double> xyzwpr, int mode);
